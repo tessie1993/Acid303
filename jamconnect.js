@@ -2,6 +2,12 @@
  * JamConnect — WebRTC Signaling Session + Token Auth + Real-Time Acid303 Jam Engine
  * Uses PeerJS signaling server (with custom signaling server option) so QR codes and
  * invite links only carry a compact Session ID + Auth Key Token.
+ *
+ * Linked-instance model: the Host is only the connector (star hub). Every participant
+ * (Host included) runs and controls their OWN Acid303 instance — pattern, synth knobs,
+ * waveform, delay. Instance changes are tagged with the origin peer id and mirrored
+ * into a separate remote voice on every other peer, so everyone hears the whole jam.
+ * Only the shared clock (transport start/stop, tempo, swing) is linked.
  */
 
 const DEFAULT_ICE_SERVERS = [
@@ -46,13 +52,15 @@ class JamConnector {
     this.timeOffset = 0; // ms difference: hostClock - localClock
     this.rtt = 0;
 
-    // Sync permissions / flags
+    // Id of this participant's own instance ('HOST' for the host, PeerJS id for guests)
+    this.localId = null;
+    this.localName = options.name || '';
+
+    // Sync permissions / flags (only the shared clock is permission-gated;
+    // each participant always controls their own instance)
     this.permissions = {
       allowGuestTransport: true,
-      allowGuestTempo: true,
-      allowGuestPattern: true,
-      allowGuestSynth: true,
-      allowGuestMidi: true
+      allowGuestTempo: true
     };
 
     this._pingInterval = null;
@@ -64,14 +72,21 @@ class JamConnector {
     this.onPeerDisconnected = null;    // (peerId, peersList)
     this.onConnectionStateChange = null; // (statusObj)
     this.onAuthError = null;           // (reason)
-    this.onPadTriggered = null;        // (instrument, note, velocity, scheduledTime, extra)
-    this.onPatternUpdated = null;      // (pattern, stepIndex, stepData)
-    this.onSynthParamUpdated = null;   // (paramName, value, rawParams)
+    // Instance callbacks receive the originId of the peer whose instance changed
+    this.onPadTriggered = null;        // (instrument, note, velocity, scheduledTime, extra, originId)
+    this.onPatternUpdated = null;      // (pattern, stepIndex, stepData, presetName, originId)
+    this.onSynthParamUpdated = null;   // (paramName, value, normalizedValue, originId)
+    this.onMidiMessage = null;         // (midiEvent, originId)
+    this.onInstanceState = null;       // (originId, snapshot, name) — full state of a remote instance
+    this.onInstanceRemoved = null;     // (originId) — remote instance left; null = all remote instances
+    this.getLocalInstanceSnapshot = null;   // () => snapshot of this participant's own instance
+    this.getRemoteInstanceSnapshots = null; // () => ({ [originId]: { name, snapshot } })
+
+    // Shared (linked) settings callbacks
     this.onSongSettingUpdated = null;  // (settingName, value)
-    this.onMidiMessage = null;         // (midiEvent)
     this.onPermissionsUpdated = null;  // (permissions)
-    this.getFullStateSnapshot = null;  // () => ({ pattern, params, bpm, swing, delayWet, isPlaying, step })
-    this.applyFullStateSnapshot = null; // (snapshot) => void
+    this.getSharedStateSnapshot = null;  // () => ({ bpm, swingPct })
+    this.applySharedStateSnapshot = null; // (snapshot) => void
   }
 
   // ==========================================
@@ -150,6 +165,7 @@ class JamConnector {
   async createHostSession(existingSessionId = null, existingAuthToken = null) {
     this.disconnect();
     this.isHost = true;
+    this.localId = 'HOST';
 
     this.sessionId = existingSessionId || `303-${generateRandomCode(4)}`;
     this.authToken = existingAuthToken || generateRandomCode(8, '23456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz');
@@ -291,6 +307,8 @@ class JamConnector {
       clearTimeout(authTimeout);
       const existed = this.peers.delete(peerId);
       if (existed) {
+        if (this.onInstanceRemoved) this.onInstanceRemoved(peerId);
+        this.broadcast({ type: 'PEER_LEFT', id: peerId });
         this._broadcastPeerList();
         if (this.onPeerDisconnected) {
           this.onPeerDisconnected(peerId, this.getConnectedPeersList());
@@ -305,7 +323,19 @@ class JamConnector {
 
   _completeGuestAuth(peerRecord) {
     const { conn, id } = peerRecord;
-    const snapshot = this.getFullStateSnapshot ? this.getFullStateSnapshot() : null;
+    const snapshot = this.getSharedStateSnapshot ? this.getSharedStateSnapshot() : null;
+
+    // Every other instance in the jam (host's own + other guests), so the new guest can
+    // spin up a remote voice for each of them. The guest's own instance is never sent back.
+    const instances = {};
+    if (this.getLocalInstanceSnapshot) {
+      instances[this.localId] = { name: this.localName || 'Host', snapshot: this.getLocalInstanceSnapshot() };
+    }
+    if (this.getRemoteInstanceSnapshots) {
+      for (const [originId, inst] of Object.entries(this.getRemoteInstanceSnapshots() || {})) {
+        if (originId !== id) instances[originId] = inst;
+      }
+    }
 
     this._sendTo(conn, {
       type: 'AUTH_OK',
@@ -313,6 +343,7 @@ class JamConnector {
       peerId: id,
       permissions: this.permissions,
       snapshot,
+      instances,
       hostTime: performance.now(),
       hostAudioTime: this.Tone.now(),
       transportState: this.Tone.Transport.state,
@@ -351,6 +382,8 @@ class JamConnector {
 
     const targetHostPeerId = `${PEER_PREFIX}${this.sessionId}`;
     const myGuestId = `${PEER_PREFIX}guest-${generateRandomCode(5)}`;
+    this.localId = myGuestId;
+    const myName = guestName || this.localName || `Synth-${myGuestId.slice(-4)}`;
 
     this._emitConnectionState('connecting', `Joining session ${this.sessionId}...`);
 
@@ -381,7 +414,7 @@ class JamConnector {
           serialization: 'json',
           metadata: {
             authToken: this.authToken,
-            name: guestName || `Synth-${myGuestId.slice(-4)}`
+            name: myName
           }
         });
 
@@ -391,7 +424,7 @@ class JamConnector {
           this._sendTo(conn, {
             type: 'AUTH_HELLO',
             authToken: this.authToken,
-            name: guestName || `Synth-${myGuestId.slice(-4)}`
+            name: myName
           });
         });
 
@@ -416,9 +449,18 @@ class JamConnector {
               this.permissions = { ...this.permissions, ...msg.permissions };
               if (this.onPermissionsUpdated) this.onPermissionsUpdated(this.permissions);
             }
-            if (msg.snapshot && this.applyFullStateSnapshot) {
-              this.applyFullStateSnapshot(msg.snapshot);
+            if (msg.snapshot && this.applySharedStateSnapshot) {
+              this.applySharedStateSnapshot(msg.snapshot);
             }
+            if (msg.instances && this.onInstanceState) {
+              for (const [originId, inst] of Object.entries(msg.instances)) {
+                if (originId !== this.localId && inst) {
+                  this.onInstanceState(originId, inst.snapshot, inst.name);
+                }
+              }
+            }
+            // Announce our own instance so the host (and through it, everyone) can mirror it
+            this.sendInstanceState();
             this._applyTransportSync(msg);
             this._emitConnectionState('connected', `Connected to ${this.sessionId}`);
             if (this.onPeerConnected) {
@@ -439,6 +481,7 @@ class JamConnector {
           const wasConnected = this.isConnectedToHost;
           this.isConnectedToHost = false;
           this.hostConn = null;
+          if (this.onInstanceRemoved) this.onInstanceRemoved(null);
           this._emitConnectionState('disconnected', 'Disconnected from Host');
           if (wasConnected && this.onPeerDisconnected) {
             this.onPeerDisconnected('HOST', []);
@@ -493,8 +536,11 @@ class JamConnector {
       this.peer = null;
     }
 
+    const hadSession = !!this.localId;
     this.isHost = false;
     this.isConnectedToHost = false;
+    this.localId = null;
+    if (hadSession && this.onInstanceRemoved) this.onInstanceRemoved(null);
     this._emitConnectionState('idle', 'Offline');
   }
 
@@ -610,19 +656,21 @@ class JamConnector {
         break;
 
       case 'PERMISSIONS_UPDATE':
+        if (this.isHost) return; // only the host sets permissions
         this.permissions = { ...this.permissions, ...msg.permissions };
         if (this.onPermissionsUpdated) this.onPermissionsUpdated(this.permissions);
         break;
 
-      case 'FULL_STATE_SYNC':
-        if (msg.snapshot && this.applyFullStateSnapshot) {
-          this.applyFullStateSnapshot(msg.snapshot);
+      case 'PEER_LEFT':
+        if (!this.isHost && msg.id && this.onInstanceRemoved) {
+          this.onInstanceRemoved(msg.id);
         }
-        if (this.isHost) this.broadcast(msg, senderId);
         break;
 
+      // ---------- Linked (shared clock) messages ----------
+
       case 'TRANSPORT_STATE':
-        if (this.isHost && !this.permissions.allowGuestTransport && senderId !== 'HOST') return;
+        if (this.isHost && !this.permissions.allowGuestTransport) return;
         this._applyTransportSync(msg);
         if (this.isHost) {
           this.broadcast(msg, senderId);
@@ -630,32 +678,12 @@ class JamConnector {
         break;
 
       case 'TRANSPORT_HEARTBEAT':
+        if (this.isHost) return;
         this._applyTransportHeartbeat(msg);
         break;
 
-      case 'PATTERN_STEP_UPDATE':
-      case 'PATTERN_FULL_UPDATE':
-        if (this.isHost && !this.permissions.allowGuestPattern && senderId !== 'HOST') return;
-        if (this.onPatternUpdated) {
-          this.onPatternUpdated(msg.pattern || null, msg.stepIndex, msg.stepData, msg.presetName);
-        }
-        if (this.isHost) {
-          this.broadcast(msg, senderId);
-        }
-        break;
-
-      case 'SYNTH_PARAM_UPDATE':
-        if (this.isHost && !this.permissions.allowGuestSynth && senderId !== 'HOST') return;
-        if (this.onSynthParamUpdated) {
-          this.onSynthParamUpdated(msg.param, msg.value, msg.normalizedValue);
-        }
-        if (this.isHost) {
-          this.broadcast(msg, senderId);
-        }
-        break;
-
       case 'SONG_SETTING_UPDATE':
-        if (this.isHost && !this.permissions.allowGuestTempo && senderId !== 'HOST') return;
+        if (this.isHost && !this.permissions.allowGuestTempo) return;
         if (this.onSongSettingUpdated) {
           this.onSongSettingUpdated(msg.setting, msg.value);
         }
@@ -664,27 +692,74 @@ class JamConnector {
         }
         break;
 
+      // ---------- Per-instance messages (each peer's own Acid303) ----------
+
+      case 'INSTANCE_STATE':
+      case 'PATTERN_STEP_UPDATE':
+      case 'PATTERN_FULL_UPDATE':
+      case 'SYNTH_PARAM_UPDATE':
       case 'PAD_PLAY':
-        if (this.isHost && !this.permissions.allowGuestMidi && senderId !== 'HOST') return;
+      case 'MIDI_EVENT':
+        this._routeInstanceMessage(msg, senderId);
+        break;
+    }
+  }
+
+  /**
+   * Instance messages always describe the SENDER's own instance. The host stamps the
+   * origin with the authenticated connection id (guests cannot spoof each other) and
+   * relays to everyone else; receivers apply it to the matching remote voice only.
+   */
+  _routeInstanceMessage(msg, senderId) {
+    let originId;
+    let originName = msg.name;
+    if (this.isHost) {
+      originId = senderId;
+      const peer = this.peers.get(senderId);
+      if (peer) originName = peer.name;
+      msg = { ...msg, from: originId, name: originName };
+    } else {
+      originId = msg.from || senderId;
+    }
+    if (!originId || originId === this.localId) return;
+
+    switch (msg.type) {
+      case 'INSTANCE_STATE':
+        if (this.onInstanceState) {
+          this.onInstanceState(originId, msg.snapshot, originName);
+        }
+        break;
+
+      case 'PATTERN_STEP_UPDATE':
+      case 'PATTERN_FULL_UPDATE':
+        if (this.onPatternUpdated) {
+          this.onPatternUpdated(msg.pattern || null, msg.stepIndex, msg.stepData, msg.presetName, originId);
+        }
+        break;
+
+      case 'SYNTH_PARAM_UPDATE':
+        if (this.onSynthParamUpdated) {
+          this.onSynthParamUpdated(msg.param, msg.value, msg.normalizedValue, originId);
+        }
+        break;
+
+      case 'PAD_PLAY':
         if (this.onPadTriggered) {
           const delaySec = Math.max(0, (msg.delayFromSendMs || 20) - (this.rtt / 2)) / 1000;
           const playTime = this.Tone.now() + delaySec;
-          this.onPadTriggered(msg.instrument, msg.note, msg.velocity, playTime, msg.extra);
-        }
-        if (this.isHost) {
-          this.broadcast(msg, senderId);
+          this.onPadTriggered(msg.instrument, msg.note, msg.velocity, playTime, msg.extra, originId);
         }
         break;
 
       case 'MIDI_EVENT':
-        if (this.isHost && !this.permissions.allowGuestMidi && senderId !== 'HOST') return;
         if (this.onMidiMessage) {
-          this.onMidiMessage(msg.event);
-        }
-        if (this.isHost) {
-          this.broadcast(msg, senderId);
+          this.onMidiMessage(msg.event, originId);
         }
         break;
+    }
+
+    if (this.isHost) {
+      this.broadcast(msg, senderId);
     }
   }
 
@@ -829,9 +904,20 @@ class JamConnector {
     });
   }
 
+  sendInstanceState() {
+    if (!this.getLocalInstanceSnapshot) return;
+    this.broadcast({
+      type: 'INSTANCE_STATE',
+      from: this.localId,
+      name: this.localName || (this.isHost ? 'Host' : undefined),
+      snapshot: this.getLocalInstanceSnapshot()
+    });
+  }
+
   sendPatternStepUpdate(stepIndex, stepData) {
     this.broadcast({
       type: 'PATTERN_STEP_UPDATE',
+      from: this.localId,
       stepIndex,
       stepData
     });
@@ -840,6 +926,7 @@ class JamConnector {
   sendFullPatternUpdate(pattern, presetName = null) {
     this.broadcast({
       type: 'PATTERN_FULL_UPDATE',
+      from: this.localId,
       pattern,
       presetName
     });
@@ -848,13 +935,16 @@ class JamConnector {
   sendSynthParamUpdate(param, value, normalizedValue = null) {
     this.broadcast({
       type: 'SYNTH_PARAM_UPDATE',
+      from: this.localId,
       param,
       value,
       normalizedValue
     });
   }
 
+  /** Shared (linked) song settings, e.g. swing. Gated by the tempo permission for guests. */
   sendSongSettingUpdate(setting, value) {
+    if (!this.isHost && this.isConnectedToHost && !this.permissions.allowGuestTempo) return;
     this.broadcast({
       type: 'SONG_SETTING_UPDATE',
       setting,
@@ -874,6 +964,7 @@ class JamConnector {
   sendMidiEvent(event) {
     this.broadcast({
       type: 'MIDI_EVENT',
+      from: this.localId,
       event
     });
   }
@@ -899,11 +990,12 @@ class JamConnector {
     const delayFromSendMs = Math.round((scheduledTime - now) * 1000);
 
     if (this.onPadTriggered) {
-      this.onPadTriggered(instrument, note, velocity, scheduledTime, extra);
+      this.onPadTriggered(instrument, note, velocity, scheduledTime, extra, this.localId);
     }
 
     this.broadcast({
       type: 'PAD_PLAY',
+      from: this.localId,
       instrument,
       note,
       velocity,
@@ -1043,23 +1135,15 @@ class JamConnectClient {
               </div>
             </div>
 
-            <!-- Host Co-op Permissions -->
+            <!-- Host Co-op Permissions (only the shared clock is controlled by the host) -->
             <div class="bg-slate-950/80 border border-slate-800 rounded-lg p-2.5 mt-1">
-              <div class="text-[10px] font-mono text-slate-400 uppercase mb-1.5">Guest Jam Permissions</div>
+              <div class="text-[10px] font-mono text-slate-400 uppercase mb-1.5">Linked Clock Permissions</div>
               <div class="flex flex-wrap gap-3 text-xs font-mono text-slate-300">
                 <label class="flex items-center gap-1.5 cursor-pointer">
-                  <input type="checkbox" id="perm-tempo" checked class="accent-emerald-500 rounded" /> Tempo/Play
-                </label>
-                <label class="flex items-center gap-1.5 cursor-pointer">
-                  <input type="checkbox" id="perm-pattern" checked class="accent-emerald-500 rounded" /> 303 Pattern
-                </label>
-                <label class="flex items-center gap-1.5 cursor-pointer">
-                  <input type="checkbox" id="perm-synth" checked class="accent-emerald-500 rounded" /> Synth Knobs
-                </label>
-                <label class="flex items-center gap-1.5 cursor-pointer">
-                  <input type="checkbox" id="perm-midi" checked class="accent-emerald-500 rounded" /> Live MIDI/Pads
+                  <input type="checkbox" id="perm-tempo" checked class="accent-emerald-500 rounded" /> Guests can change Tempo/Swing &amp; Play/Stop
                 </label>
               </div>
+              <div class="text-[10px] font-mono text-slate-500 mt-1.5">Every jammer runs their own 303 (pattern, knobs, sound). You hear everyone, but each person only controls their own instance.</div>
             </div>
           </div>
         </div>
@@ -1238,9 +1322,6 @@ class JamConnectClient {
       });
     };
     bindPerm('perm-tempo', 'allowGuestTempo');
-    bindPerm('perm-pattern', 'allowGuestPattern');
-    bindPerm('perm-synth', 'allowGuestSynth');
-    bindPerm('perm-midi', 'allowGuestMidi');
 
     this.connector.onConnectionStateChange = (statusObj) => {
       this._updateStatusUI(statusObj);

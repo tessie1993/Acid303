@@ -1,4 +1,4 @@
-const CACHE_NAME = 'Jam303-dev-v1';
+const CACHE_NAME = 'Jam303-dev-v2';
 const ASSETS = [
   './',
   './app.js',

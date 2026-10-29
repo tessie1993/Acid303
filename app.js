@@ -78,6 +78,47 @@ const visualizer = new Visualizer(waveAnalyser, "visualizer-canvas");
 // Chain 303 Audio Routing
 tb303.chain(distortion, delay, waveAnalyser, Tone.Destination);
 
+// This participant's own 303 instance. Remote jammers get their own voice objects
+// with the same shape (see REMOTE JAM INSTANCES below).
+const localVoice = { synth: tb303, distortion, delay, params };
+
+// Maps a normalized knob value (0..1) onto a voice's sound engine; returns the display label
+const VOICE_KNOBS = {
+  cutoff: (voice, val) => {
+    const freq = 100 * Math.pow(80, val);
+    voice.params.cutoff = freq;
+    voice.synth.filterEnvelope.baseFrequency = freq;
+    return `${Math.round(freq)} Hz`;
+  },
+  reso: (voice, val) => {
+    const q = 1 + val * 19;
+    voice.params.resonance = q;
+    voice.synth.filter.Q.value = q;
+    return q.toFixed(1);
+  },
+  envmod: (voice, val) => {
+    voice.params.envMod = val;
+    voice.synth.filterEnvelope.octaves = val * 5;
+    return `${Math.round(val * 100)}%`;
+  },
+  decay: (voice, val) => {
+    const decayTime = 0.1 + val * 1.1;
+    voice.params.decay = decayTime;
+    voice.synth.envelope.decay = decayTime;
+    voice.synth.filterEnvelope.decay = decayTime;
+    return `${Math.round(decayTime * 1000)}ms`;
+  },
+  accent: (voice, val) => {
+    voice.params.accent = val;
+    return `${Math.round(val * 100)}%`;
+  },
+  drive: (voice, val) => {
+    voice.params.drive = val;
+    voice.distortion.distortion = val;
+    return `${Math.round(val * 100)}%`;
+  }
+};
+
 // Synthesized 909-style Drum Voices for Live Jam Pads
 const kickDrum = new Tone.MembraneSynth({
   pitchDecay: 0.04,
@@ -357,19 +398,21 @@ renderGrid();
    4. AUDIO SEQUENCER LOOP & ACCENT/SLIDE SYNTHESIS LOGIC
    ========================================================================= */
 
-function play303StepNote(noteFreq, { accent = false, slide = false, duration = "16n" } = {}, time = Tone.now()) {
+function play303StepNote(noteFreq, { accent = false, slide = false, duration = "16n" } = {}, time = Tone.now(), voice = localVoice) {
+  const synth = voice.synth;
+  const p = voice.params;
   if (accent) {
-    tb303.volume.setValueAtTime(4, time);
-    tb303.filterEnvelope.octaves = params.envMod * 7.5 * params.accent;
-    tb303.envelope.decay = params.decay * 0.7;
+    synth.volume.setValueAtTime(4, time);
+    synth.filterEnvelope.octaves = p.envMod * 7.5 * p.accent;
+    synth.envelope.decay = p.decay * 0.7;
   } else {
-    tb303.volume.setValueAtTime(0, time);
-    tb303.filterEnvelope.octaves = params.envMod * 4.5;
-    tb303.envelope.decay = params.decay;
+    synth.volume.setValueAtTime(0, time);
+    synth.filterEnvelope.octaves = p.envMod * 4.5;
+    synth.envelope.decay = p.decay;
   }
 
-  tb303.portamento = slide ? 0.08 : 0;
-  tb303.triggerAttackRelease(noteFreq, duration, time);
+  synth.portamento = slide ? 0.08 : 0;
+  synth.triggerAttackRelease(noteFreq, duration, time);
 }
 
 // Tone.js Repeat Loop — locked to Transport ticks for multi-peer beat alignment
@@ -398,6 +441,18 @@ Tone.Transport.scheduleRepeat((time) => {
       slide: stepData.slide,
       duration: "16n"
     }, time);
+  }
+
+  // Linked jammers: every remote instance plays its own pattern on the shared clock
+  for (const voice of remoteVoices.values()) {
+    const remoteStep = voice.pattern[stepIdx];
+    if (remoteStep && remoteStep.gate) {
+      play303StepNote(`${remoteStep.note}${remoteStep.octave}`, {
+        accent: remoteStep.accent,
+        slide: remoteStep.slide,
+        duration: "16n"
+      }, time, voice);
+    }
   }
 
   currentStep = (stepIdx + 1) % 16;
@@ -474,43 +529,17 @@ function setupKnob(id, paramKey, onChange) {
   knobsByName[paramKey] = new Knob(id, paramKey, onChange);
 }
 
-setupKnob('knob-cutoff', 'cutoff', (val) => {
-  const freq = 100 * Math.pow(80, val);
-  params.cutoff = freq;
-  tb303.filterEnvelope.baseFrequency = freq;
-  document.getElementById('val-cutoff').textContent = `${Math.round(freq)} Hz`;
-});
-
-setupKnob('knob-reso', 'reso', (val) => {
-  const q = 1 + val * 19;
-  params.resonance = q;
-  tb303.filter.Q.value = q;
-  document.getElementById('val-reso').textContent = q.toFixed(1);
-});
-
-setupKnob('knob-envmod', 'envmod', (val) => {
-  params.envMod = val;
-  tb303.filterEnvelope.octaves = val * 5;
-  document.getElementById('val-envmod').textContent = `${Math.round(val * 100)}%`;
-});
-
-setupKnob('knob-decay', 'decay', (val) => {
-  const decayTime = 0.1 + val * 1.1;
-  params.decay = decayTime;
-  tb303.envelope.decay = decayTime;
-  tb303.filterEnvelope.decay = decayTime;
-  document.getElementById('val-decay').textContent = `${Math.round(decayTime * 1000)}ms`;
-});
-
-setupKnob('knob-accent', 'accent', (val) => {
-  params.accent = val;
-  document.getElementById('val-accent').textContent = `${Math.round(val * 100)}%`;
-});
-
-setupKnob('knob-drive', 'drive', (val) => {
-  params.drive = val;
-  distortion.distortion = val;
-  document.getElementById('val-drive').textContent = `${Math.round(val * 100)}%`;
+[
+  ['knob-cutoff', 'cutoff', 'val-cutoff'],
+  ['knob-reso', 'reso', 'val-reso'],
+  ['knob-envmod', 'envmod', 'val-envmod'],
+  ['knob-decay', 'decay', 'val-decay'],
+  ['knob-accent', 'accent', 'val-accent'],
+  ['knob-drive', 'drive', 'val-drive']
+].forEach(([knobId, paramKey, labelId]) => {
+  setupKnob(knobId, paramKey, (val) => {
+    document.getElementById(labelId).textContent = VOICE_KNOBS[paramKey](localVoice, val);
+  });
 });
 
 /* =========================================================================
@@ -580,6 +609,7 @@ function onStateChanged(state) {
   playBtn.disabled = !state.canStart || state.isPlaying;
   stopBtn.disabled = !state.canStop;
   tempoSlider.disabled = !state.canChangeBpm;
+  swingSlider.disabled = !state.canChangeBpm;
 
   syncTransportUI(state.isPlaying);
 
@@ -634,9 +664,8 @@ waveSqr.addEventListener('click', () => applyWaveform('square', false));
 
 delayToggle.addEventListener('change', (e) => {
   delay.wet.value = e.target.checked ? 0.25 : 0;
-  if (!isApplyingRemoteUpdate) {
-    jcClient.connector.sendSongSettingUpdate('delay', e.target.checked);
-  }
+  // Delay belongs to this player's own instance (not a linked setting)
+  jcClient.connector.sendSynthParamUpdate('delay', e.target.checked);
 });
 
 swingSlider.addEventListener('input', (e) => {
@@ -689,36 +718,166 @@ randomizeBtn.addEventListener('click', randomizePattern);
    7. WEBRTC JAM CALLBACKS, LIVE JAM PADS & WEB MIDI API INTEGRATION
    ========================================================================= */
 
-// Provide full session snapshot when a new guest authenticates
-jcClient.connector.getFullStateSnapshot = () => ({
+/* ---------- REMOTE JAM INSTANCES ----------
+   Every other jammer runs their own Acid303. We keep a mirrored copy of each one
+   (pattern + sound settings) driving its own 303 voice here, so everyone hears the
+   full jam while only controlling their own instance. */
+
+const REMOTE_VOICE_GAIN_DB = -3;
+const remoteVoices = new Map(); // originId -> voice
+
+function emptyPattern() {
+  return Array(16).fill(null).map(() => ({ note: 'C', octave: 2, gate: false, accent: false, slide: false }));
+}
+
+// Remote steps feed the shared sequencer loop, so only accept well-formed ones
+function sanitizeStep(step) {
+  const s = step || {};
+  return {
+    note: NOTES.includes(s.note) ? s.note : 'C',
+    octave: [1, 2, 3].includes(Number(s.octave)) ? Number(s.octave) : 2,
+    gate: !!s.gate,
+    accent: !!s.accent,
+    slide: !!s.slide
+  };
+}
+
+function getRemoteVoice(originId, name) {
+  let voice = remoteVoices.get(originId);
+  if (!voice) {
+    const synth = new Tone.MonoSynth({
+      oscillator: { type: 'sawtooth' },
+      envelope: { attack: 0.003, decay: 0.3, sustain: 0, release: 0.05 },
+      filter: { Q: 7, type: 'lowpass', rolloff: -24 },
+      filterEnvelope: { attack: 0.003, decay: 0.3, sustain: 0.0, release: 0.1, baseFrequency: 400, octaves: 3, exponent: 2 }
+    });
+    const voiceDistortion = new Tone.Distortion({ distortion: 0.35, wet: 0.6 });
+    const voiceDelay = new Tone.PingPongDelay({ delayTime: "8n.", feedback: 0.3, wet: 0.25 });
+    const output = new Tone.Volume(REMOTE_VOICE_GAIN_DB);
+    synth.chain(voiceDistortion, voiceDelay, output, waveAnalyser);
+
+    voice = {
+      id: originId,
+      name: name || 'Jammer',
+      synth,
+      distortion: voiceDistortion,
+      delay: voiceDelay,
+      output,
+      params: { cutoff: 400, resonance: 7, envMod: 0.6, decay: 0.3, accent: 0.8, drive: 0.35, waveform: 'sawtooth' },
+      knobValues: { cutoff: 0.4, reso: 0.7, envmod: 0.6, decay: 0.3, accent: 0.8, drive: 0.35 },
+      pattern: emptyPattern(),
+      delayEnabled: true
+    };
+    Object.entries(voice.knobValues).forEach(([k, v]) => VOICE_KNOBS[k](voice, v));
+    remoteVoices.set(originId, voice);
+  } else if (name) {
+    voice.name = name;
+  }
+  return voice;
+}
+
+function applyRemoteVoiceParam(voice, paramName, value) {
+  if (paramName === 'waveform') {
+    if (value === 'sawtooth' || value === 'square') {
+      voice.params.waveform = value;
+      voice.synth.oscillator.type = value;
+    }
+  } else if (paramName === 'delay') {
+    voice.delayEnabled = !!value;
+    voice.delay.wet.value = value ? 0.25 : 0;
+  } else if (VOICE_KNOBS[paramName] && typeof value === 'number') {
+    const v = Math.min(1, Math.max(0, value));
+    voice.knobValues[paramName] = v;
+    VOICE_KNOBS[paramName](voice, v);
+  }
+}
+
+function removeRemoteVoice(originId) {
+  const voice = remoteVoices.get(originId);
+  if (!voice) return;
+  remoteVoices.delete(originId);
+  voice.synth.triggerRelease();
+  // Let any tail (delay feedback) ring out briefly before disposing the nodes
+  setTimeout(() => {
+    [voice.synth, voice.distortion, voice.delay, voice.output].forEach(node => node.dispose());
+  }, 1500);
+}
+
+// Snapshot of THIS player's own instance (sent to everyone else when joining / on request)
+jcClient.connector.getLocalInstanceSnapshot = () => ({
   pattern,
   knobValues: { ...knobValues },
   waveform: params.waveform,
-  bpm: Math.round(Tone.Transport.bpm.value),
-  swingPct: Math.round((Tone.Transport.swing || 0) * 100),
   delayEnabled: delayToggle.checked
 });
 
-// Apply full session snapshot received from Host upon joining
-jcClient.connector.applyFullStateSnapshot = (snapshot) => {
+// Host only: hand a joining guest the current state of every other remote instance
+jcClient.connector.getRemoteInstanceSnapshots = () => {
+  const out = {};
+  for (const voice of remoteVoices.values()) {
+    out[voice.id] = {
+      name: voice.name,
+      snapshot: {
+        pattern: voice.pattern,
+        knobValues: { ...voice.knobValues },
+        waveform: voice.params.waveform,
+        delayEnabled: voice.delayEnabled
+      }
+    };
+  }
+  return out;
+};
+
+// A remote jammer's full instance state (on join, or when they announce themselves)
+jcClient.connector.onInstanceState = (originId, snapshot, name) => {
+  const voice = getRemoteVoice(originId, name);
+  if (!snapshot) return;
+  if (Array.isArray(snapshot.pattern) && snapshot.pattern.length === 16) {
+    voice.pattern = snapshot.pattern.map(sanitizeStep);
+  }
+  if (snapshot.knobValues) {
+    Object.entries(snapshot.knobValues).forEach(([k, v]) => applyRemoteVoiceParam(voice, k, v));
+  }
+  if (snapshot.waveform) applyRemoteVoiceParam(voice, 'waveform', snapshot.waveform);
+  if (typeof snapshot.delayEnabled === 'boolean') applyRemoteVoiceParam(voice, 'delay', snapshot.delayEnabled);
+};
+
+jcClient.connector.onInstanceRemoved = (originId) => {
+  if (originId === null) {
+    Array.from(remoteVoices.keys()).forEach(removeRemoteVoice);
+  } else {
+    removeRemoteVoice(originId);
+  }
+};
+
+// A remote jammer edited their own pattern -> update their mirrored voice only
+jcClient.connector.onPatternUpdated = (newPattern, stepIndex, stepData, presetName, originId) => {
+  const voice = getRemoteVoice(originId);
+  if (Array.isArray(newPattern) && newPattern.length === 16) {
+    voice.pattern = newPattern.map(sanitizeStep);
+  } else if (Number.isInteger(stepIndex) && stepIndex >= 0 && stepIndex < 16 && stepData) {
+    voice.pattern[stepIndex] = sanitizeStep({ ...voice.pattern[stepIndex], ...stepData });
+  }
+};
+
+// A remote jammer tweaked their own knobs / waveform / delay -> update their voice only
+jcClient.connector.onSynthParamUpdated = (paramName, value, normalizedValue, originId) => {
+  const voice = getRemoteVoice(originId);
+  const targetVal = typeof normalizedValue === 'number' ? normalizedValue : value;
+  applyRemoteVoiceParam(voice, paramName, targetVal);
+};
+
+/* ---------- LINKED (SHARED CLOCK) SETTINGS ---------- */
+
+jcClient.connector.getSharedStateSnapshot = () => ({
+  bpm: Math.round(Tone.Transport.bpm.value),
+  swingPct: Math.round((Tone.Transport.swing || 0) * 100)
+});
+
+jcClient.connector.applySharedStateSnapshot = (snapshot) => {
   if (!snapshot) return;
   isApplyingRemoteUpdate = true;
   try {
-    if (Array.isArray(snapshot.pattern) && snapshot.pattern.length === 16) {
-      pattern = JSON.parse(JSON.stringify(snapshot.pattern));
-      drawGrid();
-      renderGrid();
-    }
-    if (snapshot.knobValues) {
-      Object.entries(snapshot.knobValues).forEach(([k, v]) => {
-        if (knobsByName[k] && typeof v === 'number') {
-          knobsByName[k].setValue(v, true);
-        }
-      });
-    }
-    if (snapshot.waveform) {
-      applyWaveform(snapshot.waveform, true);
-    }
     if (typeof snapshot.bpm === 'number') {
       Tone.Transport.bpm.value = snapshot.bpm;
       tempoSlider.value = snapshot.bpm;
@@ -731,48 +890,12 @@ jcClient.connector.applyFullStateSnapshot = (snapshot) => {
       swingSlider.value = snapshot.swingPct;
       swingVal.textContent = `${snapshot.swingPct}%`;
     }
-    if (typeof snapshot.delayEnabled === 'boolean') {
-      delayToggle.checked = snapshot.delayEnabled;
-      delay.wet.value = snapshot.delayEnabled ? 0.25 : 0;
-    }
   } finally {
     isApplyingRemoteUpdate = false;
   }
 };
 
-// Receive single-step or full-pattern updates from peers
-jcClient.connector.onPatternUpdated = (newPattern, stepIndex, stepData, presetName) => {
-  isApplyingRemoteUpdate = true;
-  try {
-    if (Array.isArray(newPattern) && newPattern.length === 16) {
-      pattern = JSON.parse(JSON.stringify(newPattern));
-      if (presetName && patternSelect) patternSelect.value = presetName;
-      drawGrid();
-      renderGrid();
-    } else if (typeof stepIndex === 'number' && stepData) {
-      updateSingleStepUI(stepIndex, stepData);
-    }
-  } finally {
-    isApplyingRemoteUpdate = false;
-  }
-};
-
-// Receive real-time synth knob or waveform tweaks from peers
-jcClient.connector.onSynthParamUpdated = (paramName, value, normalizedValue) => {
-  isApplyingRemoteUpdate = true;
-  try {
-    if (paramName === 'waveform') {
-      applyWaveform(value, true);
-    } else if (knobsByName[paramName]) {
-      const targetVal = typeof normalizedValue === 'number' ? normalizedValue : value;
-      knobsByName[paramName].setValue(targetVal, true);
-    }
-  } finally {
-    isApplyingRemoteUpdate = false;
-  }
-};
-
-// Receive song setting changes (swing, delay) from peers
+// Shared song settings (swing) from the session
 jcClient.connector.onSongSettingUpdated = (setting, value) => {
   isApplyingRemoteUpdate = true;
   try {
@@ -782,9 +905,6 @@ jcClient.connector.onSongSettingUpdated = (setting, value) => {
       Tone.Transport.swingSubdivision = "16n";
       swingSlider.value = pct;
       swingVal.textContent = `${Math.round(pct)}%`;
-    } else if (setting === 'delay') {
-      delayToggle.checked = !!value;
-      delay.wet.value = value ? 0.25 : 0;
     }
   } finally {
     isApplyingRemoteUpdate = false;
@@ -792,8 +912,12 @@ jcClient.connector.onSongSettingUpdated = (setting, value) => {
 };
 
 // Handle Live Pad & Quantized Note Triggers (Local & Remote)
-jcClient.connector.onPadTriggered = (instrument, note, velocity = 0.85, scheduledTime = Tone.now(), extra = {}) => {
+jcClient.connector.onPadTriggered = (instrument, note, velocity = 0.85, scheduledTime = Tone.now(), extra = {}, originId = null) => {
   const playAt = Math.max(Tone.now(), scheduledTime || Tone.now());
+  // 303 pad notes play on the triggering jammer's own voice; drum pads share the kit
+  const isRemote = originId && originId !== jcClient.connector.localId;
+  const voice = isRemote ? getRemoteVoice(originId) : localVoice;
+  extra = extra || {};
   switch (instrument) {
     case 'kick':
       kickDrum.triggerAttackRelease(note || 'C1', '8n', playAt, velocity);
@@ -808,11 +932,11 @@ jcClient.connector.onPadTriggered = (instrument, note, velocity = 0.85, schedule
       clapDrum.triggerAttackRelease('16n', playAt, velocity);
       break;
     case '303-accent':
-      play303StepNote(note || 'C3', { accent: true, slide: !!extra.slide, duration: '16n' }, playAt);
+      play303StepNote(note || 'C3', { accent: true, slide: !!extra.slide, duration: '16n' }, playAt, voice);
       break;
     case '303':
     default:
-      play303StepNote(note || 'C2', { accent: velocity > 0.85 || !!extra.accent, slide: !!extra.slide, duration: '16n' }, playAt);
+      play303StepNote(note || 'C2', { accent: velocity > 0.85 || !!extra.accent, slide: !!extra.slide, duration: '16n' }, playAt, voice);
       break;
   }
 };
